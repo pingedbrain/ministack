@@ -8,6 +8,7 @@ import json
 import os
 import sys
 import threading
+import time
 import types
 import urllib.request
 import uuid as _uuid_mod
@@ -1085,3 +1086,92 @@ def test_agentcore_memory_lifecycle_and_pagination():
         control.delete_memory(memoryId=memory_id)
         if second_memory_id:
             control.delete_memory(memoryId=second_memory_id)
+
+
+def test_agentcore_memory_stores_and_retrieves_long_term_records():
+    control = _client("bedrock-agentcore-control")
+    data_plane = _client("bedrock-agentcore")
+    created = control.create_memory(
+        name=f"records_{_uuid_mod.uuid4().hex[:8]}", eventExpiryDuration=30
+    )
+    memory_id = created["memory"]["id"]
+    try:
+        result = data_plane.batch_create_memory_records(
+            memoryId=memory_id,
+            records=[
+                {
+                    "requestIdentifier": "first",
+                    "namespaces": ["tenant/acme"],
+                    "content": {"text": "MiniStack stores durable deployment notes."},
+                    "timestamp": time.time(),
+                    "metadata": {"source": {"stringValue": "manual"}},
+                },
+                {
+                    "requestIdentifier": "second",
+                    "namespaces": ["tenant/acme"],
+                    "content": {"text": "AgentCore Memory retrieves deployment notes."},
+                    "timestamp": time.time(),
+                },
+                {
+                    "requestIdentifier": "other-tenant",
+                    "namespaces": ["tenant/other"],
+                    "content": {"text": "Deployment notes belong to another tenant."},
+                    "timestamp": time.time(),
+                },
+            ],
+        )
+        assert len(result["successfulRecords"]) == 3
+        assert result["failedRecords"] == []
+        record_id = result["successfulRecords"][0]["memoryRecordId"]
+
+        first_page = data_plane.list_memory_records(
+            memoryId=memory_id, namespace="tenant/acme", maxResults=1
+        )
+        assert len(first_page["memoryRecordSummaries"]) == 1
+        assert first_page["nextToken"]
+        second_page = data_plane.list_memory_records(
+            memoryId=memory_id,
+            namespace="tenant/acme",
+            maxResults=1,
+            nextToken=first_page["nextToken"],
+        )
+        assert len(second_page["memoryRecordSummaries"]) == 1
+        assert all(
+            item["namespaces"] == ["tenant/acme"]
+            for item in first_page["memoryRecordSummaries"] + second_page["memoryRecordSummaries"]
+        )
+
+        retrieved = data_plane.retrieve_memory_records(
+            memoryId=memory_id,
+            namespace="tenant/acme",
+            searchCriteria={"searchQuery": "durable deployment notes", "topK": 1},
+        )["memoryRecordSummaries"]
+        assert len(retrieved) == 1
+        assert "durable" in retrieved[0]["content"]["text"]
+        assert retrieved[0]["score"] > 0
+
+        record = data_plane.get_memory_record(
+            memoryId=memory_id, memoryRecordId=record_id, namespace="tenant/acme"
+        )["memoryRecord"]
+        assert record["content"]["text"] == "MiniStack stores durable deployment notes."
+        deleted = data_plane.delete_memory_record(
+            memoryId=memory_id, memoryRecordId=record_id, namespace="tenant/acme"
+        )
+        assert deleted["memoryRecordId"] == record_id
+        with pytest.raises(ClientError) as exc:
+            data_plane.get_memory_record(memoryId=memory_id, memoryRecordId=record_id)
+        assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+        with pytest.raises(ClientError) as exc:
+            data_plane.list_memory_records(
+                memoryId=memory_id,
+                namespace="tenant/acme",
+                metadataFilters=[{
+                    "left": {"metadataKey": "source"},
+                    "operator": "EQUALS_TO",
+                    "right": {"metadataValue": {"stringValue": "manual"}},
+                }],
+            )
+        assert exc.value.response["Error"]["Code"] == "ValidationException"
+    finally:
+        control.delete_memory(memoryId=memory_id)

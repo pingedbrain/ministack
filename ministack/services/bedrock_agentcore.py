@@ -60,6 +60,7 @@ _runtimes = AccountRegionScopedDict()    # agentRuntimeId -> runtime record
 _endpoints = AccountRegionScopedDict()   # agentRuntimeId -> {endpointName -> endpoint record}
 _resource_policies = AccountRegionScopedDict()  # resource ARN -> policy string
 _memories = AccountRegionScopedDict()    # memoryId -> memory record
+_memory_records = AccountRegionScopedDict()  # memoryId -> {memoryRecordId -> record}
 _containers = {}  # (account, region, runtime id, version) -> Docker container
 _container_lock = threading.RLock()
 
@@ -74,6 +75,7 @@ def get_state():
         "endpoints": _endpoints,
         "resourcePolicies": _resource_policies,
         "memories": _memories,
+        "memoryRecords": _memory_records,
     })
 
 
@@ -88,10 +90,12 @@ def _restore_state(data):
     _endpoints.clear()
     _resource_policies.clear()
     _memories.clear()
+    _memory_records.clear()
     _runtimes.update(data.get("runtimes", {}))
     _endpoints.update(data.get("endpoints", {}))
     _resource_policies.update(data.get("resourcePolicies", {}))
     _memories.update(data.get("memories", {}))
+    _memory_records.update(data.get("memoryRecords", {}))
     _migrate_legacy_arns()
     # Backfill one snapshot for state written before version history existed.
     for runtime in _runtimes._data.values():
@@ -132,6 +136,7 @@ def reset():
     _endpoints.clear()
     _resource_policies.clear()
     _memories.clear()
+    _memory_records.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -407,6 +412,7 @@ def _create_memory(body):
         if field in data:
             record[field] = copy.deepcopy(data[field])
     _memories[memory_id] = record
+    _memory_records[memory_id] = {}
 
     response = _memory_public_record(record)
     response["status"] = "CREATING"
@@ -471,7 +477,196 @@ def _delete_memory(memory_id):
     record = _memories.pop(memory_id, None)
     if record is None:
         return _not_found(f"Memory '{memory_id}' not found")
+    _memory_records.pop(memory_id, None)
     return json_response({"memoryId": memory_id, "status": "DELETING"}, 202)
+
+
+_MEMORY_NAMESPACE_RE = re.compile(
+    r"^[a-zA-Z0-9/*][a-zA-Z0-9\-_/*]*(?::[a-zA-Z0-9\-_/*]+)*[a-zA-Z0-9\-_/*]*$"
+)
+
+
+def _memory_records_for(memory_id):
+    memory_id = _memory_id(memory_id)
+    if memory_id not in _memories:
+        return None, _not_found(f"Memory '{memory_id}' not found")
+    return _memory_records.setdefault(memory_id, {}), None
+
+
+def _valid_memory_namespace(namespace):
+    return (
+        isinstance(namespace, str)
+        and 1 <= len(namespace) <= 1024
+        and _MEMORY_NAMESPACE_RE.fullmatch(namespace) is not None
+    )
+
+
+def _memory_record_view(record):
+    return copy.deepcopy(record)
+
+
+def _memory_record_summaries(records, namespace=None):
+    summaries = []
+    for record in records.values():
+        if namespace and not any(
+            item == namespace or item.startswith(namespace.rstrip("/") + "/")
+            for item in record.get("namespaces", [])
+        ):
+            continue
+        summaries.append(_memory_record_view(record))
+    summaries.sort(key=lambda item: (item.get("createdAt", 0), item["memoryRecordId"]))
+    return summaries
+
+
+def _validate_record_scope(data):
+    namespace = data.get("namespace") or data.get("namespacePath")
+    if namespace is not None and not _valid_memory_namespace(namespace):
+        return None, _validation("namespace must be a valid AgentCore Memory namespace")
+    if data.get("metadataFilters"):
+        return None, _validation("Memory metadata filters are not supported by MiniStack yet")
+    if data.get("memoryStrategyId"):
+        return None, _validation("Memory strategies are not supported by MiniStack AgentCore Memory")
+    return namespace, None
+
+
+def _create_memory_records(memory_id, body):
+    data = _parse_body(body)
+    records, error = _memory_records_for(memory_id)
+    if error:
+        return error
+    entries = data.get("records")
+    if not isinstance(entries, list) or not entries:
+        return _validation("records must contain at least one memory record")
+    if len(entries) > 100:
+        return _validation("records cannot contain more than 100 memory records")
+
+    prepared = []
+    identifiers = set()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            return _validation("each record must be an object")
+        request_id = entry.get("requestIdentifier")
+        namespaces = entry.get("namespaces")
+        content = entry.get("content")
+        text = content.get("text") if isinstance(content, dict) else None
+        if not isinstance(request_id, str) or not request_id:
+            return _validation("requestIdentifier is required for each record")
+        if not isinstance(namespaces, list) or len(namespaces) != 1 or not _valid_memory_namespace(namespaces[0]):
+            return _validation("each record must have exactly one valid namespace")
+        if not isinstance(text, str) or not text:
+            return _validation("record content.text is required")
+        if entry.get("memoryStrategyId"):
+            return _validation("Memory strategies are not supported by MiniStack AgentCore Memory")
+        if request_id in identifiers:
+            return _validation("requestIdentifier values must be unique within a batch")
+        identifiers.add(request_id)
+        metadata = entry.get("metadata", {})
+        if not isinstance(metadata, dict):
+            return _validation("record metadata must be an object")
+        created_at = entry.get("timestamp", time.time())
+        prepared.append((request_id, namespaces, text, metadata, created_at))
+
+    successful = []
+    for request_id, namespaces, text, metadata, created_at in prepared:
+        record_id = f"mem-{new_uuid().replace('-', '')}{_rand_suffix()}"
+        record = {
+            "memoryRecordId": record_id,
+            "content": {"text": text},
+            "namespaces": copy.deepcopy(namespaces),
+            "createdAt": created_at,
+            "metadata": copy.deepcopy(metadata),
+        }
+        records[record_id] = record
+        successful.append({
+            "memoryRecordId": record_id,
+            "status": "SUCCEEDED",
+            "requestIdentifier": request_id,
+        })
+    return json_response({"successfulRecords": successful, "failedRecords": []}, 201)
+
+
+def _list_memory_records(memory_id, body):
+    data = _parse_body(body)
+    records, error = _memory_records_for(memory_id)
+    if error:
+        return error
+    namespace, error = _validate_record_scope(data)
+    if error:
+        return error
+    items = _memory_record_summaries(records, namespace)
+    page, error = _memory_page(items, data, default=20)
+    if error:
+        return error
+    return json_response({
+        "memoryRecordSummaries": page["items"],
+        **({"nextToken": page["nextToken"]} if "nextToken" in page else {}),
+    })
+
+
+def _retrieve_memory_records(memory_id, body):
+    data = _parse_body(body)
+    records, error = _memory_records_for(memory_id)
+    if error:
+        return error
+    namespace, error = _validate_record_scope(data)
+    if error:
+        return error
+    criteria = data.get("searchCriteria")
+    query = criteria.get("searchQuery") if isinstance(criteria, dict) else None
+    if not isinstance(query, str) or not query.strip():
+        return _validation("searchCriteria.searchQuery is required")
+    if isinstance(criteria, dict) and criteria.get("memoryStrategyId"):
+        return _validation("Memory strategies are not supported by MiniStack AgentCore Memory")
+    if isinstance(criteria, dict) and criteria.get("metadataFilters"):
+        return _validation("Memory metadata filters are not supported by MiniStack yet")
+    terms = set(re.findall(r"[a-z0-9]+", query.casefold()))
+    matches = []
+    for item in _memory_record_summaries(records, namespace):
+        content_terms = set(re.findall(r"[a-z0-9]+", item["content"]["text"].casefold()))
+        overlap = len(terms & content_terms)
+        if overlap:
+            item["score"] = overlap / len(terms)
+            matches.append(item)
+    matches.sort(key=lambda item: (-item["score"], item["createdAt"], item["memoryRecordId"]))
+    if isinstance(criteria, dict) and "topK" in criteria:
+        top_k = criteria["topK"]
+        if not isinstance(top_k, int) or isinstance(top_k, bool) or not 1 <= top_k <= 100:
+            return _validation("searchCriteria.topK must be an integer from 1 to 100")
+        matches = matches[:top_k]
+    page, error = _memory_page(matches, data, default=20)
+    if error:
+        return error
+    return json_response({
+        "memoryRecordSummaries": page["items"],
+        **({"nextToken": page["nextToken"]} if "nextToken" in page else {}),
+    })
+
+
+def _get_memory_record(memory_id, record_id, query_params):
+    records, error = _memory_records_for(memory_id)
+    if error:
+        return error
+    record = records.get(record_id)
+    if record is None:
+        return _not_found(f"Memory record '{record_id}' not found")
+    namespace = _agentcore_query_value(query_params, "namespace")
+    if namespace and namespace not in record.get("namespaces", []):
+        return _not_found(f"Memory record '{record_id}' not found in namespace '{namespace}'")
+    return json_response({"memoryRecord": _memory_record_view(record)})
+
+
+def _delete_memory_record(memory_id, record_id, query_params):
+    records, error = _memory_records_for(memory_id)
+    if error:
+        return error
+    record = records.get(record_id)
+    if record is None:
+        return _not_found(f"Memory record '{record_id}' not found")
+    namespace = _agentcore_query_value(query_params, "namespace")
+    if namespace and namespace not in record.get("namespaces", []):
+        return _not_found(f"Memory record '{record_id}' not found in namespace '{namespace}'")
+    records.pop(record_id)
+    return json_response({"memoryRecordId": record_id})
 
 
 def _version_snapshot(runtime):
@@ -1199,6 +1394,23 @@ def _invoke_container(url, body, headers, content_type, session_id):
 
 async def handle_request(method, path, headers, body, query_params):
     inner = path.strip("/")
+    if inner.startswith("memories/"):
+        resource_path = inner[len("memories/"):]
+        if resource_path.endswith("/memoryRecords/batchCreate") and method == "POST":
+            memory_id = unquote(resource_path[:-len("/memoryRecords/batchCreate")])
+            return _create_memory_records(memory_id, body)
+        if resource_path.endswith("/retrieve") and method == "POST":
+            memory_id = unquote(resource_path[:-len("/retrieve")])
+            return _retrieve_memory_records(memory_id, body)
+        if resource_path.endswith("/memoryRecords") and method == "POST":
+            memory_id = unquote(resource_path[:-len("/memoryRecords")])
+            return _list_memory_records(memory_id, body)
+        if "/memoryRecord/" in resource_path and method == "GET":
+            memory_id, record_id = resource_path.rsplit("/memoryRecord/", 1)
+            return _get_memory_record(unquote(memory_id), unquote(record_id), query_params)
+        if "/memoryRecords/" in resource_path and method == "DELETE":
+            memory_id, record_id = resource_path.rsplit("/memoryRecords/", 1)
+            return _delete_memory_record(unquote(memory_id), unquote(record_id), query_params)
     if inner == "memories" and method == "POST":
         return _list_memories(body)
     if inner == "memories/create" and method == "POST":

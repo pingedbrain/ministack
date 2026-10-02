@@ -10,6 +10,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 ### Added
 
 - **Bedrock AgentCore — Memory resource lifecycle** — `CreateMemory`, `GetMemory`, `ListMemories`, `UpdateMemory` and `DeleteMemory` now provide account- and region-scoped local resources with pagination. Memory strategies and tagging return explicit validation errors instead of being silently discarded. Contributed by @pingedbrain.
+- **Bedrock AgentCore — explicit long-term Memory records** — `BatchCreateMemoryRecords`, `ListMemoryRecords`, `RetrieveMemoryRecords`, `GetMemoryRecord` and `DeleteMemoryRecord` support namespace-scoped records, pagination and deterministic lexical retrieval. No event ingestion, managed strategies, embeddings, metadata filters or tagging. Contributed by @pingedbrain.
 
 ## [1.5.20] — 2026-10-01
 
