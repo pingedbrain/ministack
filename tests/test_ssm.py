@@ -1116,3 +1116,119 @@ def test_unicode_ssm_parameter(ssm):
     ssm.put_parameter(Name="/unicode/param", Value="값: τιμή", Type="String")
     resp = ssm.get_parameter(Name="/unicode/param")
     assert resp["Parameter"]["Value"] == "값: τιμή"
+
+
+# ── Documents + Automation Executions ──────────────────────
+
+
+def _doc_name(prefix="test-doc"):
+    return f"{prefix}-{_uuid_mod.uuid4().hex[:8]}"
+
+
+def test_ssm_create_and_describe_document(ssm):
+    name = _doc_name()
+    ssm.create_document(Name=name, DocumentType="Automation",
+                        DocumentFormat="YAML",
+                        Content="schemaVersion: '0.3'\nmainSteps: []\n")
+    resp = ssm.describe_document(Name=name)
+    assert resp["Document"]["Name"] == name
+    assert resp["Document"]["Status"] == "Active"
+    assert resp["Document"]["DocumentType"] == "Automation"
+
+
+def test_ssm_describe_missing_document(ssm):
+    with pytest.raises(ClientError) as exc:
+        ssm.describe_document(Name=f"missing-{_uuid_mod.uuid4().hex[:8]}")
+    assert exc.value.response["Error"]["Code"] == "InvalidDocument"
+
+
+def test_ssm_create_document_duplicate(ssm):
+    name = _doc_name()
+    ssm.create_document(Name=name, Content="x")
+    with pytest.raises(ClientError) as exc:
+        ssm.create_document(Name=name, Content="y")
+    assert exc.value.response["Error"]["Code"] == "DocumentAlreadyExists"
+
+
+def test_ssm_get_and_list_documents(ssm):
+    name = _doc_name()
+    ssm.create_document(Name=name, DocumentType="Automation",
+                        Content="schemaVersion: '0.3'\nmainSteps: []\n")
+    got = ssm.get_document(Name=name)
+    assert got["Name"] == name
+    assert "schemaVersion" in got["Content"]
+    listed = ssm.list_documents()
+    assert any(d["Name"] == name for d in listed["DocumentIdentifiers"])
+
+
+def test_ssm_delete_document(ssm):
+    name = _doc_name()
+    ssm.create_document(Name=name, Content="x")
+    ssm.delete_document(Name=name)
+    with pytest.raises(ClientError) as exc:
+        ssm.describe_document(Name=name)
+    assert exc.value.response["Error"]["Code"] == "InvalidDocument"
+
+
+def test_ssm_start_automation_execution(ssm):
+    name = _doc_name("runbook")
+    ssm.create_document(Name=name, DocumentType="Automation",
+                        Content="schemaVersion: '0.3'\nmainSteps: []\n")
+    started = ssm.start_automation_execution(
+        DocumentName=name,
+        Parameters={"AutomationAssumeRole": ["arn:aws:iam::000000000000:role/x"]},
+    )
+    assert started["AutomationExecutionId"]
+    detail = ssm.get_automation_execution(
+        AutomationExecutionId=started["AutomationExecutionId"])
+    aex = detail["AutomationExecution"]
+    assert aex["DocumentName"] == name
+    assert aex["AutomationExecutionStatus"] in (
+        "Pending", "InProgress", "Success")
+    deadline = time.time() + 15
+    while aex["AutomationExecutionStatus"] == "InProgress" and time.time() < deadline:
+        time.sleep(0.5)
+        aex = ssm.get_automation_execution(
+            AutomationExecutionId=started["AutomationExecutionId"]
+        )["AutomationExecution"]
+    assert aex["AutomationExecutionStatus"] == "Success"
+
+
+def test_ssm_start_missing_document(ssm):
+    with pytest.raises(ClientError) as exc:
+        ssm.start_automation_execution(
+            DocumentName=f"missing-{_uuid_mod.uuid4().hex[:8]}")
+    # Real AWS answers a missing document at Start with
+    # AutomationDefinitionNotFoundException, not InvalidDocument.
+    assert (exc.value.response["Error"]["Code"]
+            == "AutomationDefinitionNotFoundException")
+
+
+def test_ssm_get_missing_automation_execution(ssm):
+    with pytest.raises(ClientError) as exc:
+        ssm.get_automation_execution(
+            AutomationExecutionId=str(_uuid_mod.uuid4()))
+    assert (exc.value.response["Error"]["Code"]
+            == "AutomationExecutionNotFoundException")
+
+
+def test_ssm_describe_automation_executions(ssm):
+    name = _doc_name("runbook")
+    ssm.create_document(Name=name, DocumentType="Automation", Content="x")
+    started = ssm.start_automation_execution(DocumentName=name)
+    listed = ssm.describe_automation_executions()
+    ids = [e["AutomationExecutionId"]
+           for e in listed["AutomationExecutionMetadataList"]]
+    assert started["AutomationExecutionId"] in ids
+
+
+def test_ssm_stop_automation_execution(ssm):
+    name = _doc_name("runbook")
+    ssm.create_document(Name=name, DocumentType="Automation", Content="x")
+    started = ssm.start_automation_execution(DocumentName=name)
+    ssm.stop_automation_execution(
+        AutomationExecutionId=started["AutomationExecutionId"])
+    detail = ssm.get_automation_execution(
+        AutomationExecutionId=started["AutomationExecutionId"])
+    assert (detail["AutomationExecution"]["AutomationExecutionStatus"]
+            == "Cancelled")
