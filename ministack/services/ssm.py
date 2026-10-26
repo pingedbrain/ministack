@@ -8,7 +8,19 @@ Supports: PutParameter, GetParameter, GetParameters, GetParametersByPath,
           GetParameterHistory, LabelParameterVersion,
           AddTagsToResource, RemoveTagsFromResource, ListTagsForResource,
           SendCommand, GetCommandInvocation, ListCommands,
-          DescribeInstanceInformation.
+          DescribeInstanceInformation,
+          CreateDocument, DeleteDocument, DescribeDocument, GetDocument,
+          ListDocuments,
+          StartAutomationExecution, GetAutomationExecution,
+          DescribeAutomationExecutions, StopAutomationExecution.
+
+Documents + Automation executions are state-level emulation: the document
+body is stored and validated, and an execution records itself then
+transitions to a terminal status on a background thread (the same pattern
+as SendCommand invocations). The automation's steps do not run against
+emulated resources — an execution reaching Success means "the runbook was
+accepted and completed", which is the contract callers like korz's
+self-healer poll for.
 """
 
 import base64
@@ -40,6 +52,8 @@ _parameters = AccountRegionScopedDict()
 _parameter_history = AccountRegionScopedDict()
 _tags = AccountRegionScopedDict()
 _commands = AccountRegionScopedDict()
+_documents = AccountRegionScopedDict()
+_automation_executions = AccountRegionScopedDict()
 
 
 # ── Persistence ────────────────────────────────────────────
@@ -50,6 +64,8 @@ def get_state():
         "parameter_history": copy.deepcopy(_parameter_history),
         "tags": copy.deepcopy(_tags),
         "commands": copy.deepcopy(_commands),
+        "documents": copy.deepcopy(_documents),
+        "automation_executions": copy.deepcopy(_automation_executions),
     }
 
 
@@ -106,6 +122,8 @@ def _restore_state(data):
         _restore_parameter_history(data.get("parameter_history", {}))
         _tags.update(data.get("tags", {}))
         _commands.update(data.get("commands", {}))
+        _documents.update(data.get("documents", {}))
+        _automation_executions.update(data.get("automation_executions", {}))
 
 
 def _now_iso() -> str:
@@ -248,6 +266,15 @@ async def handle_request(method, path, headers, body, query_params):
         "GetCommandInvocation": _get_command_invocation,
         "ListCommands": _list_commands,
         "DescribeInstanceInformation": _describe_instance_information,
+        "CreateDocument": _create_document,
+        "DeleteDocument": _delete_document,
+        "DescribeDocument": _describe_document,
+        "GetDocument": _get_document,
+        "ListDocuments": _list_documents,
+        "StartAutomationExecution": _start_automation_execution,
+        "GetAutomationExecution": _get_automation_execution,
+        "DescribeAutomationExecutions": _describe_automation_executions,
+        "StopAutomationExecution": _stop_automation_execution,
     }
 
     handler = handlers.get(action)
@@ -1062,8 +1089,288 @@ def _describe_instance_information(data):
     return json_response(out)
 
 
+
+
+# ── Documents ─────────────────────────────────────────────
+#
+# Name is the document id within an account+region (AWS semantics). The
+# document body is stored verbatim; schema validation of Content is not
+# attempted — the value of the emulation is that names resolve, versions
+# exist, and invalid names fail with the real error shape.
+
+_DOCUMENT_TYPES = {
+    "Command", "Policy", "Automation", "Session", "Package",
+    "ApplicationConfiguration", "ApplicationConfigurationSchema",
+    "DeploymentStrategy", "ChangeCalendar", "Automation.ChangeTemplate",
+    "ProblemAnalysis", "ProblemAnalysisTemplate", "CloudFormation",
+    "ConformancePackTemplate", "QuickSetup",
+}
+
+
+def _document_description(doc):
+    return {
+        "Sha1": doc.get("Sha1", ""),
+        "Hash": doc.get("Hash", ""),
+        "HashType": doc.get("HashType", "Sha256"),
+        "Name": doc["Name"],
+        "Owner": doc.get("Owner", get_account_id()),
+        "CreatedDate": doc["CreatedDate"],
+        "Status": doc.get("Status", "Active"),
+        "StatusInformation": doc.get("StatusInformation", ""),
+        "DocumentVersion": doc.get("DocumentVersion", "1"),
+        "Description": doc.get("Description", ""),
+        "Parameters": doc.get("Parameters", []),
+        "PlatformTypes": doc.get("PlatformTypes", []),
+        "DocumentType": doc.get("DocumentType", "Automation"),
+        "SchemaVersion": doc.get("SchemaVersion", "0.3"),
+        "DocumentFormat": doc.get("DocumentFormat", "YAML"),
+        "Tags": doc.get("Tags", []),
+    }
+
+
+def _doc_missing(name):
+    return error_response_json(
+        "InvalidDocument", f"Document with name {name} does not exist.", 400
+    )
+
+
+def _create_document(data):
+    name = data.get("Name")
+    if not name:
+        return error_response_json("ValidationException", "Name is required", 400)
+    content = data.get("Content")
+    if not content:
+        return error_response_json("ValidationException", "Content is required", 400)
+    doc_type = data.get("DocumentType", "Command")
+    if doc_type not in _DOCUMENT_TYPES:
+        return error_response_json(
+            "InvalidDocumentType",
+            f"Document type {doc_type} does not exist.",
+            400,
+        )
+    if _documents.get(name) is not None:
+        return error_response_json(
+            "DocumentAlreadyExists",
+            f"Document with name {name} already exists.",
+            400,
+        )
+    doc = {
+        "Name": name,
+        "Content": content,
+        "DocumentType": doc_type,
+        "DocumentFormat": data.get("DocumentFormat", "YAML"),
+        "DocumentVersion": "1",
+        "Status": "Active",
+        "CreatedDate": _now_iso(),
+        "Owner": get_account_id(),
+        "Hash": base64.b64encode(content.encode()).decode()[:40],
+        "HashType": "Sha256",
+        "Tags": data.get("Tags", []),
+    }
+    _documents[name] = doc
+    return json_response({"DocumentDescription": _document_description(doc)})
+
+
+def _delete_document(data):
+    name = data.get("Name")
+    if not name:
+        return error_response_json("ValidationException", "Name is required", 400)
+    if _documents.get(name) is None:
+        return _doc_missing(name)
+    del _documents[name]
+    return json_response({})
+
+
+def _describe_document(data):
+    name = data.get("Name")
+    if not name:
+        return error_response_json("ValidationException", "Name is required", 400)
+    doc = _documents.get(name)
+    if doc is None:
+        return _doc_missing(name)
+    return json_response({"Document": _document_description(doc)})
+
+
+def _get_document(data):
+    name = data.get("Name")
+    if not name:
+        return error_response_json("ValidationException", "Name is required", 400)
+    doc = _documents.get(name)
+    if doc is None:
+        return _doc_missing(name)
+    return json_response({
+        "Name": name,
+        "DocumentVersion": doc.get("DocumentVersion", "1"),
+        "Status": doc.get("Status", "Active"),
+        "Content": doc.get("Content", ""),
+        "DocumentType": doc.get("DocumentType", "Automation"),
+        "DocumentFormat": doc.get("DocumentFormat", "YAML"),
+    })
+
+
+def _list_documents(data):
+    out = {
+        "DocumentIdentifiers": [
+            {
+                "Name": d["Name"],
+                "Owner": d.get("Owner", get_account_id()),
+                "DocumentVersion": d.get("DocumentVersion", "1"),
+                "DocumentType": d.get("DocumentType", "Automation"),
+                "SchemaVersion": d.get("SchemaVersion", "0.3"),
+                "DocumentFormat": d.get("DocumentFormat", "YAML"),
+            }
+            for d in _documents.values()
+        ]
+    }
+    return json_response(out)
+
+
+# ── Automation executions ─────────────────────────────────
+#
+# An execution is a recorded state transition, not a run against emulated
+# resources: InProgress on Start, Success on the background finisher.
+# StopAutomationExecution marks it Cancelled — the same surface AWS exposes
+# for an automation that was accepted and then stopped.
+
+
+def _automation_execution_response(record):
+    out = {
+        "AutomationExecutionId": record["AutomationExecutionId"],
+        "DocumentName": record["DocumentName"],
+        "DocumentVersion": record.get("DocumentVersion", "$DEFAULT"),
+        "AutomationExecutionStatus": record["Status"],
+        "ExecutionStartTime": record["ExecutionStartTime"],
+        "ExecutedBy": record.get("ExecutedBy", ""),
+        "Outputs": record.get("Outputs", {}),
+        "Mode": record.get("Mode", "Auto"),
+        "Parameters": record.get("Parameters", {}),
+        # Timestamps parse: omit, never "" — botocore rejects empty strings.
+        "StepExecutions": [
+            {k: v for k, v in st.items() if v != ""} for st in record.get("StepExecutions", [])
+        ],
+        "StepExecutionsTruncated": False,
+        "TargetLocations": record.get("TargetLocations", []),
+        "AutomationType": "Local",
+        "Runbooks": record.get("Runbooks", []),
+    }
+    # Solo incluir EndTime cuando el automation termino — "" rompe el parse.
+    if record.get("ExecutionEndTime"):
+        out["ExecutionEndTime"] = record["ExecutionEndTime"]
+    return out
+
+
+def _start_automation_execution(data):
+    doc_name = data.get("DocumentName") or ""
+    if not doc_name:
+        return error_response_json(
+            "ValidationException", "DocumentName is required", 400
+        )
+    # The document must exist locally — there is no hosted AWS catalogue in
+    # the emulator, so callers seed the runbooks they rely on via
+    # CreateDocument. Real AWS answers a missing document at Start with
+    # AutomationDefinitionNotFoundException, not InvalidDocument (botocore
+    # ssm-2014-11-06 service model).
+    if _documents.get(doc_name) is None:
+        return error_response_json(
+            "AutomationDefinitionNotFoundException",
+            f"Automation definition is not found: {doc_name}",
+            400,
+        )
+    execution_id = new_uuid()
+    record = {
+        "AutomationExecutionId": execution_id,
+        "DocumentName": doc_name,
+        "DocumentVersion": data.get("DocumentVersion", "$DEFAULT"),
+        "Status": "InProgress",
+        "ExecutionStartTime": _now_iso(),
+        "ExecutedBy": get_account_id(),
+        "Parameters": data.get("Parameters", {}),
+        "Mode": data.get("Mode", "Auto"),
+        "StepExecutions": [
+            {
+                "StepName": "automation",
+                "Action": "aws:executeAutomation",
+                "StepStatus": "InProgress",
+                "StepExecutionId": execution_id,
+            }
+        ],
+    }
+    _automation_executions[execution_id] = record
+    spawn_background(_finish_automation, execution_id)
+    return json_response({"AutomationExecutionId": execution_id})
+
+
+def _finish_automation(execution_id):
+    """Terminal state on a background thread — mirrors _finish_invocation."""
+    import time
+
+    time.sleep(0.5)
+    record = _automation_executions.get(execution_id)
+    if not record or record["Status"] != "InProgress":
+        return
+    record["Status"] = "Success"
+    record["ExecutionEndTime"] = _now_iso()
+    for step in record.get("StepExecutions", []):
+        step["StepStatus"] = "Success"
+        step["ExecutionEndTime"] = _now_iso()
+
+
+def _get_automation_execution(data):
+    execution_id = data.get("AutomationExecutionId") or ""
+    if not execution_id:
+        return error_response_json(
+            "ValidationException", "AutomationExecutionId is required", 400
+        )
+    record = _automation_executions.get(execution_id)
+    if not record:
+        return error_response_json(
+            "AutomationExecutionNotFoundException",
+            f"Automation execution {execution_id} does not exist.",
+            400,
+        )
+    return json_response({"AutomationExecution": _automation_execution_response(record)})
+
+
+def _describe_automation_executions(data):
+    items = [
+        {
+            "AutomationExecutionId": r["AutomationExecutionId"],
+            "DocumentName": r["DocumentName"],
+            "DocumentVersion": r.get("DocumentVersion", "$DEFAULT"),
+            "AutomationExecutionStatus": r["Status"],
+            "ExecutionStartTime": r["ExecutionStartTime"],
+            "ExecutedBy": r.get("ExecutedBy", ""),
+            "Mode": r.get("Mode", "Auto"),
+            **({"ExecutionEndTime": r["ExecutionEndTime"]} if r.get("ExecutionEndTime") else {}),
+        }
+        for r in _automation_executions.values()
+    ]
+    return json_response({"AutomationExecutionMetadataList": items})
+
+
+def _stop_automation_execution(data):
+    execution_id = data.get("AutomationExecutionId") or ""
+    if not execution_id:
+        return error_response_json(
+            "ValidationException", "AutomationExecutionId is required", 400
+        )
+    record = _automation_executions.get(execution_id)
+    if not record:
+        return error_response_json(
+            "AutomationExecutionNotFoundException",
+            f"Automation execution {execution_id} does not exist.",
+            400,
+        )
+    if record["Status"] in ("InProgress", "Pending"):
+        record["Status"] = "Cancelled"
+        record["ExecutionEndTime"] = _now_iso()
+    return json_response({})
+
+
 def reset():
     _parameters.clear()
     _parameter_history.clear()
     _tags.clear()
     _commands.clear()
+    _documents.clear()
+    _automation_executions.clear()
