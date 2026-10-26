@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **SSM — Documents and Automation executions** — the `ssm` service covered only Parameter Store and Run Command; the whole runbook surface answered `InvalidAction`. Documents: `CreateDocument`, `DescribeDocument`, `GetDocument`, `ListDocuments`, `DeleteDocument`, account+region scoped. Executions: `StartAutomationExecution`, `GetAutomationExecution`, `DescribeAutomationExecutions`, `StopAutomationExecution`, recording the `InProgress` → terminal lifecycle on a background finisher like SendCommand invocations. A missing document fails `InvalidDocument` on describe and `AutomationDefinitionNotFoundException` on start, matching the modeled error surface; timestamp fields are omitted until set.
+
 ## [1.5.25] — 2026-10-10
 
 ### Added
